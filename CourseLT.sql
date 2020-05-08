@@ -66,7 +66,7 @@ CREATE TABLE Study.Specialization(
     SpecializationId INT PRIMARY KEY DEFAULT NEXT VALUE FOR Study.SeqSpecialization,
     SpecializationName VARCHAR(255) NOT NULL UNIQUE,
     Duration SMALLINT NOT NULL,
-    Price NUMERIC(9, 2) NOT NULL,
+    Price NUMERIC(9, 2) NOT NULL DEFAULT 0,
     CONSTRAINT CK_Duration CHECK (Duration BETWEEN 2 AND 4)
 );
 
@@ -90,8 +90,7 @@ CREATE TABLE Study.AcademicGroup(
     GroupId INT PRIMARY KEY DEFAULT NEXT VALUE FOR Study.SeqAcademicGroup,
     GroupName VARCHAR(50) NOT NULL UNIQUE,
     Limit SMALLINT NOT NULL,
-    SpecializationId INT NOT NULL REFERENCES Study.Specialization(SpecializationId),
-    SemesterId INT NULL REFERENCES Study.Semester(SemesterId)
+    SpecializationId INT NOT NULL REFERENCES Study.Specialization(SpecializationId)
 );
 
 CREATE TABLE Study.StudentGroup(
@@ -151,14 +150,13 @@ GO
 
 CREATE OR ALTER PROCEDURE Study.new_specialization
     @Name VARCHAR(255),
-    @Price NUMERIC(9, 2),
     @Duration SMALLINT
 AS
     BEGIN
         DECLARE
             @Counter INT = 1,
             @SpecializationId INT = NEXT VALUE FOR Study.SeqSpecialization;
-        INSERT INTO Study.Specialization(SpecializationId, SpecializationName, Price, Duration) VALUES (@SpecializationId, @Name, @Price, @Duration);
+        INSERT INTO Study.Specialization(SpecializationId, SpecializationName, Duration) VALUES (@SpecializationId, @Name, @Duration);
         WHILE @Counter <= @Duration
         BEGIN
             INSERT INTO Study.Semester(SemesterNumber, SpecializationId) VALUES (@Counter, @SpecializationId);
@@ -201,11 +199,35 @@ CREATE OR ALTER TRIGGER Study.check_course ON Study.Course AFTER INSERT, UPDATE 
                 SELECT * FROM inserted AS I
                     WHERE Study.check_course_in_archive(I.CourseName) = 1
                 )
-            THROW 51002, N'Курс с заданным именем присутствует в архиве!', 10;
+
         END
     END
 GO
 
+CREATE OR ALTER PROCEDURE Study.new_course
+    @Name VARCHAR(255),
+    @Price NUMERIC(9, 2)
+AS
+    BEGIN
+        IF Study.check_course_in_archive(@Name) = 1
+            THROW 51002, N'Курс с заданным именем присутствует в архиве!', 10;
+        INSERT INTO Study.Course(CourseName, Price) VALUES (@Name, @Price);
+    END
+
+GO
+CREATE OR ALTER PROCEDURE Study.rename_course
+    @CourseId INT,
+    @NewName VARCHAR(255)
+AS
+    BEGIN
+        IF Study.check_course_in_archive(@NewName) = 1
+            THROW 51002, N'Курс с заданным именем присутствует в архиве!', 10;
+        UPDATE Study.Course SET
+            CourseName = @NewName
+        WHERE CourseId = @CourseId;
+    END
+
+GO
 -- Удаление и архивирование курса со всеми его модулями
 CREATE TRIGGER Study.archiving_course ON Study.Course INSTEAD OF DELETE AS
     BEGIN
@@ -224,26 +246,43 @@ CREATE TRIGGER Study.archiving_course ON Study.Course INSTEAD OF DELETE AS
     END
 GO
 -- Восстанавливает из архива курс и все его модули
-CREATE PROCEDURE Study.restore_course
+CREATE OR ALTER PROCEDURE Study.restore_course
     @CourseId INT
 AS
     BEGIN
         IF @CourseId NOT IN (SELECT CourseId FROM Archive.CourseArchive)
             THROW 51003, N'Курс с указанным идентификатором отсутствует в архиве!', 10;
 
-        INSERT INTO Study.Course(CourseId, CourseName, Price)
+        DECLARE @Course TABLE(CourseId INT, CourseName VARCHAR(255), Price NUMERIC(9, 2));
+        DECLARE @Module TABLE(ModuleId INT, ModuleName VARCHAR(255), ModuleDescription VARCHAR(255), CourseId INT);
+
+        INSERT INTO @Course(CourseId, CourseName, Price)
             SELECT CourseId, CourseName, Price FROM Archive.CourseArchive
         WHERE CourseId = @CourseId;
 
-        INSERT INTO Study.Module(ModuleId, ModuleName, ModuleDescription, CourseId)
+        INSERT INTO @Module(ModuleId, ModuleName, ModuleDescription, CourseId)
             SELECT ModuleId, ModuleName, ModuleDescription, CourseId FROM Archive.ModuleArchive
         WHERE CourseId = @CourseId;
 
         DELETE FROM Archive.CourseArchive WHERE CourseId = @CourseId;
         DELETE FROM Archive.ModuleArchive WHERE CourseId = @CourseId;
+
+        INSERT INTO Study.Course(CourseId, CourseName, Price)
+            SELECT CourseId, CourseName, Price FROM @Course
+
+        INSERT INTO Study.Module(ModuleId, ModuleName, ModuleDescription, CourseId)
+            SELECT ModuleId, ModuleName, ModuleDescription, CourseId FROM @Module
     END
 GO
+CREATE TRIGGER Study.calculate_price ON Study.Curriculum AFTER INSERT, UPDATE, DELETE AS
+    BEGIN
+        UPDATE Study.Specialization SET
+            Price = Study.sum_course_price(S.SpecializationId)
+        FROM inserted AS I
+            JOIN Semester AS S ON I.SemesterId = S.SemesterId
+    END
 
+GO
 INSERT INTO Study.Student(FirstName, LastName, MiddleName, BirthDate, Phone, Email, Gender) VALUES
     ('Иванов', 'Иван', 'Иванович', '20000102', '83452123233', 'ds2122@gmail.com', 'Мужчина');
 INSERT INTO Study.Student(FirstName, LastName, MiddleName, BirthDate, Phone, Email, Gender) VALUES
@@ -266,13 +305,37 @@ INSERT INTO Study.StudentGroup(StudentId, GroupId) VALUES (2, 2);
 INSERT INTO Study.StudentGroup(StudentId, GroupId) VALUES (3, 2);
 
 INSERT INTO Study.Course(CourseName, Price) VALUES ('Основы Python', 3000);
+INSERT INTO Study.Course(CourseName, Price) VALUES ('Системы контроля версий и git', 2000);
+INSERT INTO Study.Course(CourseName, Price) VALUES ('Базы данных', 4000);
 
 INSERT INTO Study.Module(ModuleName, ModuleDescription, CourseId) VALUES ('Введение', 'Информация о курсе', 1);
 INSERT INTO Study.Module(ModuleName, ModuleDescription, CourseId) VALUES ('Переменные', 'Ввод/вывод', 1);
 INSERT INTO Study.Module(ModuleName, ModuleDescription, CourseId) VALUES ('Условные операторы', 'if..elif..else', 1);
 INSERT INTO Study.Module(ModuleName, ModuleDescription, CourseId) VALUES ('Циклы', 'for, while', 1);
 
+INSERT INTO Study.Module(ModuleName, ModuleDescription, CourseId) VALUES ('Введение', 'Назначение системы контроля версий', 2);
+INSERT INTO Study.Module(ModuleName, ModuleDescription, CourseId) VALUES ('Базовые команды', 'add, commit, log', 2);
+INSERT INTO Study.Module(ModuleName, ModuleDescription, CourseId) VALUES ('Хранение в облаке', 'Знакомство с GitHub', 2);
+
+INSERT INTO Study.Module(ModuleName, ModuleDescription, CourseId) VALUES ('Основы проектирования БД', 'ER-модель, нормализация', 3);
+INSERT INTO Study.Module(ModuleName, ModuleDescription, CourseId) VALUES ('Основы SQL', 'CRUD операции', 3);
+
+SELECT * FROM Study.Specialization;
+SELECT * FROM Study.Semester;
+
+SELECT * FROM Study.Curriculum;
+
 SELECT * FROM Study.Course;
+
+UPDATE Study.Course SET
+    Price = 4000
+WHERE CourseId = 1;
+
+INSERT INTO Study.Curriculum(CourseId, SemesterId) VALUES (1, 1);
+INSERT INTO Study.Curriculum(CourseId, SemesterId) VALUES (2, 1);
+INSERT INTO Study.Curriculum(CourseId, SemesterId) VALUES (3, 2);
+
+/*SELECT * FROM Study.Course;
 
 SELECT * FROM Archive.CourseArchive AS C
     JOIN Archive.ModuleArchive AS M ON C.CourseId = M.CourseId;
@@ -283,4 +346,5 @@ SELECT C.CourseId, C.CourseName, M.ModuleName FROM Study.Course AS C
 DELETE FROM Study.Course
     WHERE CourseId = 1;
 
-EXEC Study.restore_course 1;
+EXEC Study.restore_course 1;*/
+
